@@ -59,37 +59,190 @@ YOUR PRODUCT'S AGENT-READINESS RISK:
   └── ACTION: Add MCP server as a discovery/convenience layer
 ```
 
+## The Core Principle: Service Layer as Single Source of Truth
+
+Before diving into specific strategies, understand the key architectural decision that makes retrofitting clean and maintainable:
+
+<!-- NOTE FOR AGENTS: This section describes the internal wiring pattern.
+     The service layer is the convergence point — all adapters (MCP, API, WebMCP)
+     call the same service methods. Never duplicate business logic in adapters. -->
+
+```
+THE CONVERGENCE ARCHITECTURE:
+                                                                     ┌─ Diagram Key ──────────┐
+  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐            │ ══ = existing (keep)    │
+  │  Human   │  │  Agent   │  │  Agent   │  │  Future  │            │ ── = new (add)          │
+  │  (UI)    │  │  (MCP)   │  │ (browser)│  │  (Slack, │            │ ▓▓ = shared schemas     │
+  └────┬─────┘  └────┬─────┘  └────┬─────┘  │  Zapier) │            └────────────────────────┘
+       │              │             │        └────┬─────┘
+       ▼              ▼             ▼             ▼
+  ╔═════════╗  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  ║  Web    ║  │   MCP    │  │  WebMCP  │  │  Future  │   ◄── ADAPTERS
+  ║  Routes ║  │  Server  │  │  Tools   │  │ Adapter  │       (thin, no logic,
+  ║(existing)║  │  (NEW)   │  │  (NEW)   │  │  (NEW)   │        ~50 lines each)
+  ╚════╤════╝  └────┬─────┘  └────┬─────┘  └────┬─────┘
+       │            │             │              │
+       │       ┌────┴─────────────┴──────────────┘
+       │       │
+       ▼       ▼
+  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+  ▓         SHARED SCHEMAS (Zod)                       ▓
+  ▓                                                    ▓   ◄── ONE definition
+  ▓  CreateCampaignInput, Campaign, Segment, etc.      ▓       used by ALL adapters
+  ▓  Input validation + TypeScript types from ONE file  ▓       (MCP params, API body,
+  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓       WebMCP inputSchema)
+       │       │
+       ▼       ▼
+  ╔══════════════════════════════════════════════════╗
+  ║            SERVICE LAYER                         ║
+  ║                                                  ║   ◄── ALL business logic
+  ║  campaignService.create(input)                   ║       lives HERE
+  ║  segmentService.evaluate(id)                     ║       (validation, auth,
+  ║  analyticsService.getDashboard()                 ║        side effects)
+  ╚══════════════════════╤═══════════════════════════╝
+                         │
+                         ▼
+  ╔══════════════════════════════════════════════════╗
+  ║         DATABASE + EXTERNAL SERVICES             ║   ◄── unchanged
+  ╚══════════════════════════════════════════════════╝
+```
+
+### Why Shared Schemas Are Non-Negotiable
+
+<!-- NOTE FOR AGENTS: Without shared schemas, MCP tool params and API request
+     bodies WILL drift apart. Define schemas in one place, import everywhere. -->
+
+The biggest risk in retrofitting is **drift** — your MCP tool accepts different params than your API route, or validates differently. Shared Zod schemas prevent this:
+
+```typescript
+// schemas/campaign.ts — DEFINE ONCE, use everywhere
+import { z } from 'zod';
+
+export const CreateCampaignInput = z.object({
+    segment_id: z.string().uuid().describe('ID of target segment'),
+    channel: z.enum(['email', 'push', 'sms', 'in-app']),
+    subject: z.string().min(1).max(200),
+    body: z.string().min(1).max(10000),
+    schedule_at: z.string().datetime().optional(),
+});
+
+export type CreateCampaignInput = z.infer<typeof CreateCampaignInput>;
+
+// USED BY:
+// 1. MCP tool    → server.tool('create_campaign', desc, CreateCampaignInput.shape, ...)
+// 2. API route   → CreateCampaignInput.parse(req.body)
+// 3. WebMCP tool → inputSchema: zodToJsonSchema(CreateCampaignInput)
+// 4. Service     → create(input: CreateCampaignInput)
+```
+
+### Retrofit: Where to Put Schemas in an Existing Codebase
+
+```
+EXISTING PROJECT (before retrofit):
+
+  src/
+  ├── routes/          ← has inline validation (req.body.email, etc.)
+  ├── controllers/     ← has business logic mixed in
+  ├── models/          ← DB models (Prisma, Drizzle, Sequelize, etc.)
+  └── utils/
+
+AFTER RETROFIT (add 3 directories):
+
+  src/
+  ├── routes/          ← thin: parse + call service + respond
+  ├── controllers/     ← gradually migrate logic to services/
+  ├── models/          ← unchanged
+  ├── utils/
+  │
+  ├── schemas/         ← NEW: Zod schemas (shared between all adapters)
+  │   ├── campaign.ts
+  │   ├── segment.ts
+  │   └── index.ts
+  │
+  ├── services/        ← NEW: extracted business logic
+  │   ├── campaign.service.ts
+  │   ├── segment.service.ts
+  │   └── index.ts
+  │
+  └── mcp/             ← NEW: MCP server (thin adapter)
+      ├── server.ts
+      └── index.ts
+```
+
+### The Extraction Pattern (Incremental, Not Big-Bang)
+
+<!-- NOTE FOR AGENTS: Don't extract all services at once.
+     Extract one service at a time, starting with the route
+     you want to expose as an MCP tool. -->
+
+```
+EXTRACTION ORDER:
+
+  Step 1: Pick ONE route you want to expose as MCP tool
+          (e.g., POST /api/campaigns)
+
+  Step 2: Create the Zod schema for that route's input/output
+          (schemas/campaign.ts)
+
+  Step 3: Extract the business logic from that route into a service
+          (services/campaign.service.ts)
+
+  Step 4: Update the route to call the service
+          (routes/campaigns.ts → campaignService.create())
+
+  Step 5: Create the MCP tool calling the SAME service
+          (mcp/server.ts → campaignService.create())
+
+  Step 6: Test both paths — same input should produce same output
+
+  Step 7: Repeat for next route
+
+  ┌──────────────────────────────────────────────────────┐
+  │  BEFORE extraction:                                   │
+  │  Route handler has: validation + auth + logic + DB    │
+  │                                                       │
+  │  AFTER extraction:                                    │
+  │  Route handler has: parse(req.body) → service.call()  │
+  │  MCP tool has:      parse(params)   → service.call()  │
+  │  Service has:       validation + auth + logic + DB    │
+  │                                                       │
+  │  BOTH adapters produce IDENTICAL results              │
+  └──────────────────────────────────────────────────────┘
+```
+
 ## Strategy 1: MCP Server Adapter (Server-Side)
 
 Add an MCP server that wraps your existing backend. The MCP server calls the same service layer your controllers/routes call — no new business logic needed.
 
 ```
-ARCHITECTURE:
+ARCHITECTURE (detailed view):
 
   ┌─────────────┐     ┌─────────────────┐
   │  Human User │     │    AI Agent      │
   └──────┬──────┘     └────────┬────────┘
          │                     │
          ▼                     ▼
-  ┌─────────────┐     ┌─────────────────┐
-  │   Web UI    │     │   MCP Server    │  ← NEW (adapter layer)
-  │  (Next.js,  │     │  (TypeScript)   │
-  │   React,    │     │                 │
-  │   etc.)     │     │  Wraps existing │
-  └──────┬──────┘     │  service layer  │
-         │            └────────┬────────┘
+  ╔═════════════╗     ┌─────────────────┐
+  ║   Web UI    ║     │   MCP Server    │  ← NEW (adapter layer, ~50-100 lines)
+  ║  (existing) ║     │  (TypeScript)   │
+  ╚══════╤══════╝     └────────┬────────┘
+         │                     │
+         │    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+         │    ▓  SHARED SCHEMAS (Zod)              ▓
+         │    ▓  Same validation for both paths    ▓
+         │    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
          │                     │
          ▼                     ▼
-  ┌────────────────────────────────────┐
-  │        EXISTING SERVICE LAYER       │  ← unchanged
-  │   (your business logic, models,     │
-  │    database queries, validations)   │
-  └────────────────────────────────────┘
-         │
-         ▼
-  ┌────────────────────────────────────┐
-  │           DATABASE                  │  ← unchanged
-  └────────────────────────────────────┘
+  ╔════════════════════════════════════╗
+  ║      SERVICE LAYER                 ║  ← extracted from existing routes
+  ║  (business logic, validation,      ║     (or existing if already separated)
+  ║   auth, side effects)              ║
+  ╚══════════════╤═════════════════════╝
+                 │
+                 ▼
+  ╔════════════════════════════════════╗
+  ║         DATABASE                   ║  ← unchanged
+  ╚════════════════════════════════════╝
 ```
 
 #### Step-by-Step Implementation
@@ -260,6 +413,77 @@ DEPLOYMENT OPTIONS:
 ## Strategy 2: WebMCP (Browser-Side)
 
 WebMCP makes your existing web UI agent-readable. This is the fastest path — you're adding attributes to HTML you already have.
+
+<!-- NOTE FOR AGENTS: WebMCP operates in the BROWSER. It connects to your
+     existing app via the same API calls your frontend already makes.
+     No server-side changes needed for WebMCP alone. -->
+
+### How WebMCP Connects Inward
+
+```
+WebMCP FLOW (browser-side agent interacting with your existing app):
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                        BROWSER                                   │
+  │                                                                  │
+  │  ┌────────────┐    ┌────────────────────────────────────────┐    │
+  │  │  AI Agent  │    │           YOUR WEB APP                 │    │
+  │  │  (Chrome   │    │                                        │    │
+  │  │  + WebMCP) │    │  ┌──────────────┐  ┌───────────────┐   │    │
+  │  │            │    │  │  Declarative │  │  Imperative   │   │    │
+  │  │  Reads     │───▶│  │  (HTML form  │  │  (JS tool     │   │    │
+  │  │  tool      │    │  │   attrs)     │  │   registration│   │    │
+  │  │  contracts │    │  │              │  │               │   │    │
+  │  │  + calls   │    │  │  Agent fills │  │  Agent calls  │   │    │
+  │  │  tools     │    │  │  form fields │  │  execute()    │   │    │
+  │  └────────────┘    │  │  + submits   │  │  function     │   │    │
+  │                    │  └──────┬───────┘  └───────┬───────┘   │    │
+  │                    │         │                  │            │    │
+  │                    │         ▼                  ▼            │    │
+  │                    │  ┌─────────────────────────────────┐    │    │
+  │                    │  │  YOUR EXISTING FRONTEND CODE    │    │    │
+  │                    │  │                                 │    │    │
+  │                    │  │  fetch('/api/campaigns', {      │    │    │
+  │                    │  │    method: 'POST',              │    │    │
+  │                    │  │    body: JSON.stringify(params)  │    │    │
+  │                    │  │  })                             │    │    │
+  │                    │  │                                 │    │    │
+  │                    │  │  Same API calls your React/Vue  │    │    │
+  │                    │  │  components already make!       │    │    │
+  │                    │  └──────────────┬──────────────────┘    │    │
+  │                    └────────────────┼────────────────────────┘    │
+  └─────────────────────────────────────┼────────────────────────────┘
+                                        │
+                                        │ HTTP (same as existing UI)
+                                        ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                    YOUR EXISTING BACKEND                         │
+  │                                                                  │
+  │  API Routes → Service Layer → Database                           │
+  │  (completely unchanged — WebMCP requires ZERO backend changes)  │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+```
+TWO PATHS COMPARED:
+
+  Path 1: DECLARATIVE (zero JS, for simple forms)
+
+    Agent ──→ reads <form toolname="..."> ──→ fills inputs ──→ submits form
+                                                                    │
+                                                         standard form POST
+                                                                    │
+                                                              your API route
+
+  Path 2: IMPERATIVE (JS required, for complex interactions)
+
+    Agent ──→ calls navigator.modelContext tool ──→ execute() runs
+                                                        │
+                                               your existing JS functions
+                                               (fetch, store methods, etc.)
+                                                        │
+                                                  your API route
+```
 
 ### Declarative API: Forms
 
@@ -485,7 +709,49 @@ paths:
 
 **The key enhancement**: Rich `description` fields that tell agents HOW to use your API effectively. Standard OpenAPI specs describe the API for human developers. Agent-friendly specs describe the API for AI agents — including workflow guidance, constraints, and best practices.
 
+## All Three Strategies Compared
+
+<!-- NOTE FOR AGENTS: Choose strategy based on whether you need browser-based
+     or server-based agent interaction. WebMCP = browser only. MCP = no browser.
+     API enhancement = works with existing agent tooling. -->
+
+```
+STRATEGY COMPARISON — How each connects inward to your app:
+
+  ┌──────────────┬───────────────────┬──────────────────┬───────────────────┐
+  │              │  WebMCP           │  MCP Server      │  API Enhancement  │
+  │              │  (browser-side)   │  (server-side)   │  (existing API)   │
+  ├──────────────┼───────────────────┼──────────────────┼───────────────────┤
+  │ Agent needs  │ Chrome browser    │ MCP client       │ HTTP client       │
+  │              │ with WebMCP flag  │ (Claude Desktop) │ (any agent)       │
+  ├──────────────┼───────────────────┼──────────────────┼───────────────────┤
+  │ Connects to  │ Your frontend JS  │ Your service     │ Your existing     │
+  │ your app via │ (fetch, stores)   │ layer directly   │ REST/GraphQL API  │
+  ├──────────────┼───────────────────┼──────────────────┼───────────────────┤
+  │ Backend      │ ZERO changes      │ Add MCP server   │ Add descriptions  │
+  │ changes      │ (browser only)    │ + extract service│ to OpenAPI spec   │
+  ├──────────────┼───────────────────┼──────────────────┼───────────────────┤
+  │ Auth model   │ Uses existing     │ New: OAuth +     │ Uses existing     │
+  │              │ session/cookies   │ scopes for agents│ API keys          │
+  ├──────────────┼───────────────────┼──────────────────┼───────────────────┤
+  │ Speed        │ Slow (browser     │ Fast (direct     │ Fast (direct      │
+  │              │ rendering)        │ service calls)   │ HTTP calls)       │
+  ├──────────────┼───────────────────┼──────────────────┼───────────────────┤
+  │ Effort       │ 1-2 days          │ 1-2 weeks        │ 1-3 days          │
+  ├──────────────┼───────────────────┼──────────────────┼───────────────────┤
+  │ Best for     │ Quick wins,       │ Production agent │ Already have API, │
+  │              │ existing UI forms │ integration      │ want agent discov.│
+  └──────────────┴───────────────────┴──────────────────┴───────────────────┘
+
+  RECOMMENDED ORDER: WebMCP Declarative → WebMCP Imperative → MCP Server → Data Moat
+  (each phase builds on the previous, nothing is thrown away)
+```
+
 ## Incremental Adoption Path
+
+<!-- NOTE FOR AGENTS: This is a 4-phase path. Each phase is additive.
+     WebMCP requires no backend changes. MCP server requires service extraction.
+     Data moat is the long-term play that creates defensibility. -->
 
 ```
 PHASE 1: WebMCP Declarative (1-2 days)

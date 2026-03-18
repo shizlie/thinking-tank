@@ -31,6 +31,137 @@ WHERE VALUE LIVES NOW:
 
 ## Architecture: The Agent-Native Stack
 
+<!-- NOTE FOR AGENTS: This diagram shows the full architecture.
+     The key insight is that MCP Server, REST API, and WebMCP are all
+     thin adapters calling the SAME service layer through shared Zod schemas.
+     Never put business logic in adapters. -->
+
+### Full Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           CONSUMERS                                         │
+│                                                                             │
+│    Human User              AI Agent               AI Agent (browser)        │
+│    (dashboard)             (Claude, GPT)           (Chrome + WebMCP)        │
+│        │                       │                        │                   │
+└────────┼───────────────────────┼────────────────────────┼───────────────────┘
+         │                       │                        │
+         ▼                       ▼                        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      ADAPTER LAYER (thin, no logic)                         │
+│                                                                             │
+│  ╔══════════════╗    ┌──────────────┐    ┌───────────────┐                  │
+│  ║  REST API    ║    │  MCP Server  │    │  WebMCP Tools │                  │
+│  ║  (optional,  ║    │  (PRIMARY    │    │  (browser-    │                  │
+│  ║   existing)  ║    │   interface) │    │   side)       │                  │
+│  ╚══════╤═══════╝    └──────┬───────┘    └──────┬────────┘                  │
+│         │                   │                   │                           │
+│         │    Each adapter: ~50-100 lines of glue code                       │
+│         │    Parse input → call service → format response                   │
+└─────────┼───────────────────┼───────────────────┼───────────────────────────┘
+          │                   │                   │
+          ▼                   ▼                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     SHARED SCHEMAS (Zod)                                    │
+│                                                                             │
+│    schemas/campaign.ts  ──→  CreateCampaignInput, Campaign                  │
+│    schemas/segment.ts   ──→  CreateSegmentInput, Segment                    │
+│    schemas/event.ts     ──→  IngestEventInput, Event                        │
+│                                                                             │
+│    ONE schema definition produces:                                          │
+│    ├── MCP tool parameters (Zod shape)                                      │
+│    ├── API request validation (Zod parse)                                   │
+│    ├── WebMCP inputSchema (zodToJsonSchema)                                 │
+│    ├── TypeScript types (z.infer)                                           │
+│    └── Service layer input types (same inferred type)                       │
+│                                                                             │
+│    ⚠ This is the GLUE that prevents drift between adapters                 │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     SERVICE LAYER (all business logic)                       │
+│                                                                             │
+│    services/campaign.service.ts                                             │
+│    ├── create(input) ──→ validate → authz check → persist → side effects   │
+│    ├── send(id) ──→ check status → send via integration → update status    │
+│    ├── getPerformance(id) ──→ query metrics → compute aggregates           │
+│    └── suggestOptimization(id) ──→ analyze history → rank suggestions      │
+│                                                                             │
+│    RULES:                                                                   │
+│    ├── ALL validation happens here (defensive, even if adapter validated)   │
+│    ├── ALL authorization checks happen here                                 │
+│    ├── ALL side effects (email, webhooks, audit logs) happen here           │
+│    └── Adapters NEVER contain business logic                                │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+               ┌───────────────┼───────────────┐
+               ▼               ▼               ▼
+┌────────────────────┐ ┌──────────────┐ ┌─────────────────┐
+│   REPOSITORY       │ │  INTEGRATIONS│ │  AUTHORIZATION   │
+│                    │ │              │ │                   │
+│  repos/            │ │  email.ts    │ │  agent-auth.ts    │
+│  campaign.repo.ts  │ │  push.ts     │ │  OAuth + scopes   │
+│  segment.repo.ts   │ │  analytics.ts│ │  rate limits      │
+│  event.repo.ts     │ │              │ │  budget caps      │
+│                    │ │  Swap without│ │  approval gates   │
+│  Pure SQL/ORM      │ │  touching    │ │  audit logs       │
+│  No business logic │ │  services    │ │                   │
+└────────┬───────────┘ └──────────────┘ └───────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     DATA LAYER (your moat)                                   │
+│                                                                             │
+│    PostgreSQL                                                               │
+│    ├── events (behavioral data — compounds over time)                       │
+│    ├── segments (audience definitions)                                      │
+│    ├── campaigns (execution history)                                        │
+│    └── campaign_metrics (performance time-series — THIS is the moat)        │
+│                                                                             │
+│    The more data you accumulate, the smarter your tools get.                │
+│    Agents can send emails via SendGrid directly.                            │
+│    They CANNOT fabricate your historical performance data.                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### How Data Flows Through the Stack
+
+<!-- NOTE FOR AGENTS: This shows a concrete example of a single tool call
+     flowing through all layers. Use this to understand the call chain. -->
+
+```
+EXAMPLE: Agent calls create_campaign
+
+  Agent sends:  { segment_id: "abc", channel: "email", subject: "Hi", body: "..." }
+       │
+       ▼
+  MCP Server (adapter):
+  │  1. Receives params from MCP protocol
+  │  2. Parses with CreateCampaignInput.parse(params)  ← shared schema
+  │  3. Calls campaignService.create(parsed)
+  │  4. Formats response as MCP content
+       │
+       ▼
+  Service Layer:
+  │  1. Re-validates input (defensive)
+  │  2. Looks up segment → checks it exists, gets tenant_id
+  │  3. Checks authorization → can this agent create campaigns? within budget?
+  │  4. Calls campaignRepo.insert() → persists to DB
+  │  5. If schedule_at, calls emailIntegration.schedule() → queues with SendGrid
+  │  6. Writes audit log
+  │  7. Returns Campaign object
+       │
+       ▼
+  MCP Server (adapter):
+  │  Wraps Campaign object in MCP response format
+  │  { content: [{ type: "text", text: JSON.stringify(campaign) }] }
+       │
+       ▼
+  Agent receives structured campaign data with ID for tracking
+```
+
 ### Layer 1: MCP Server (Your Primary Interface)
 
 The MCP server IS your product's primary interface. Not the dashboard — the MCP server. Build it first.
@@ -146,6 +277,400 @@ server.prompt(
 3. **Return structured data**: Always return JSON. Include metadata (IDs, timestamps, pagination info).
 4. **Granular tools > god tools**: `create_campaign` + `add_variant` + `schedule_campaign` beats one giant `do_everything` tool. Let the agent orchestrate.
 5. **Include guardrails in tool logic**: Rate limits, budget caps, approval workflows — encode safety into the tool, don't trust the agent to self-limit.
+
+### Layer 1.5: The Inner Architecture (Service Layer + Shared Schemas)
+
+The MCP server is a thin adapter. Below it sits the **service layer** — the single source of truth for all business logic. This is the most important architectural decision for consistency and maintainability.
+
+```
+THE CONSISTENCY PROBLEM:
+
+  Without shared schemas, MCP and API drift apart:
+
+  MCP tool says:  channel = "email" | "push" | "sms"
+  API route says: channel = "email" | "push" | "sms" | "in-app"   ← drift!
+  Service says:   channel = string                                 ← no validation!
+
+  With shared schemas, one definition rules everything:
+
+  schemas/campaign.ts defines:  channel = "email" | "push" | "sms" | "in-app"
+  MCP tool uses:                campaignSchemas.create        ← same schema
+  API route uses:               campaignSchemas.create        ← same schema
+  Service validates with:       campaignSchemas.create        ← same schema
+```
+
+#### Architecture Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        ADAPTERS (thin, no logic)                 │
+│                                                                  │
+│  ┌─────────────┐   ┌──────────────┐   ┌───────────────────────┐ │
+│  │ MCP Server  │   │  REST API    │   │  WebMCP (browser)     │ │
+│  │ (stdio/SSE) │   │  (HTTP)      │   │  (navigator.model     │ │
+│  │             │   │              │   │   Context)             │ │
+│  └──────┬──────┘   └──────┬───────┘   └───────────┬───────────┘ │
+│         │                 │                       │              │
+└─────────┼─────────────────┼───────────────────────┼──────────────┘
+          │                 │                       │
+          ▼                 ▼                       ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    SHARED SCHEMAS (Zod)                           │
+│                                                                  │
+│  schemas/campaign.ts  — CreateCampaignInput, Campaign, etc.      │
+│  schemas/segment.ts   — CreateSegmentInput, Segment, etc.        │
+│  schemas/event.ts     — IngestEventInput, Event, etc.            │
+│                                                                  │
+│  One schema definition → used by MCP tool params, API request    │
+│  validation, service layer input validation, AND TypeScript types │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    SERVICE LAYER (all business logic)             │
+│                                                                  │
+│  services/campaign.service.ts                                    │
+│  ├── create(input: CreateCampaignInput): Promise<Campaign>       │
+│  ├── send(campaignId: string): Promise<SendResult>               │
+│  ├── getPerformance(campaignId: string): Promise<Metrics>        │
+│  └── suggestOptimization(campaignId: string): Promise<Suggestion>│
+│                                                                  │
+│  services/segment.service.ts                                     │
+│  ├── create(input: CreateSegmentInput): Promise<Segment>         │
+│  ├── evaluate(segmentId: string): Promise<UserCount>             │
+│  └── list(tenantId: string): Promise<Segment[]>                  │
+│                                                                  │
+│  Rules:                                                          │
+│  - ALL validation happens here (using shared schemas)            │
+│  - ALL authorization checks happen here                          │
+│  - ALL side effects (email sending, webhooks) happen here        │
+│  - Adapters NEVER contain business logic                         │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    REPOSITORY LAYER (data access)                │
+│                                                                  │
+│  repos/campaign.repo.ts                                          │
+│  ├── insert(data): Promise<Campaign>                             │
+│  ├── findById(id): Promise<Campaign | null>                      │
+│  ├── updateStatus(id, status): Promise<void>                     │
+│  └── listByTenant(tenantId, filters): Promise<Campaign[]>        │
+│                                                                  │
+│  Rules:                                                          │
+│  - Pure data access — no business logic                          │
+│  - Returns domain types (not raw DB rows)                        │
+│  - Handles DB-specific concerns (SQL, indexes, transactions)     │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│              EXTERNAL SERVICES (integrations)                    │
+│                                                                  │
+│  integrations/email.ts     — SendGrid/Resend wrapper             │
+│  integrations/push.ts      — Firebase/OneSignal wrapper          │
+│  integrations/analytics.ts — PostHog/Mixpanel wrapper            │
+│                                                                  │
+│  Rules:                                                          │
+│  - Thin wrappers with retry logic                                │
+│  - Swap providers without touching service layer                 │
+│  - Each integration has its own error types                      │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### Shared Schemas: The Glue That Keeps Everything Consistent
+
+Zod schemas are the single source of truth. They are used FOUR ways:
+
+```typescript
+// schemas/campaign.ts — DEFINE ONCE
+
+import { z } from 'zod';
+
+// Input schema: what callers provide
+export const CreateCampaignInput = z.object({
+    segment_id: z.string().uuid().describe('ID of target segment'),
+    channel: z
+        .enum(['email', 'push', 'sms', 'in-app'])
+        .describe('Delivery channel'),
+    subject: z.string().min(1).max(200).describe('Message subject line'),
+    body: z
+        .string()
+        .min(1)
+        .max(10000)
+        .describe('Message body (HTML for email)'),
+    schedule_at: z
+        .string()
+        .datetime()
+        .optional()
+        .describe('ISO 8601 send time, omit for immediate'),
+});
+
+// Output type: what callers receive
+export const Campaign = z.object({
+    id: z.string().uuid(),
+    segment_id: z.string().uuid(),
+    channel: z.enum(['email', 'push', 'sms', 'in-app']),
+    status: z.enum([
+        'draft',
+        'scheduled',
+        'sending',
+        'sent',
+        'paused',
+        'failed',
+    ]),
+    subject: z.string(),
+    body: z.string(),
+    segment_size: z.number().int(),
+    scheduled_at: z.string().datetime().nullable(),
+    created_at: z.string().datetime(),
+});
+
+// Inferred TypeScript types — no separate type definitions needed
+export type CreateCampaignInput = z.infer<typeof CreateCampaignInput>;
+export type Campaign = z.infer<typeof Campaign>;
+```
+
+**USE 1: MCP tool parameters** — the schema IS the tool's input definition:
+
+```typescript
+// mcp/server.ts — MCP adapter (thin, no logic)
+import { CreateCampaignInput } from '../schemas/campaign.js';
+
+server.tool(
+    'create_campaign',
+    'Create a marketing campaign targeting a user segment...',
+    CreateCampaignInput.shape, // ← Zod shape goes directly into MCP tool definition
+    async (params) => {
+        // Adapter only: parse, call service, format response
+        const input = CreateCampaignInput.parse(params);
+        const campaign = await campaignService.create(input);
+        return {
+            content: [
+                { type: 'text', text: JSON.stringify(campaign, null, 2) },
+            ],
+        };
+    },
+);
+```
+
+**USE 2: REST API request validation** — same schema validates HTTP requests:
+
+```typescript
+// api/routes/campaigns.ts — API adapter (thin, no logic)
+import { CreateCampaignInput } from '../schemas/campaign.js';
+
+router.post('/api/campaigns', async (req, res) => {
+    const input = CreateCampaignInput.parse(req.body); // same validation as MCP
+    const campaign = await campaignService.create(input); // same service call
+    res.json(campaign);
+});
+```
+
+**USE 3: Service layer input validation** — belt AND suspenders:
+
+```typescript
+// services/campaign.service.ts — ALL business logic lives here
+import { CreateCampaignInput, Campaign } from '../schemas/campaign.js';
+
+export class CampaignService {
+    constructor(
+        private campaignRepo: CampaignRepo,
+        private segmentRepo: SegmentRepo,
+        private emailService: EmailIntegration,
+        private authz: AuthorizationService,
+    ) {}
+
+    async create(input: CreateCampaignInput): Promise<Campaign> {
+        // 1. Validate (schema already parsed by adapter, but service is defensive)
+        const validated = CreateCampaignInput.parse(input);
+
+        // 2. Business rules (NOT in adapter, NOT in repo — HERE)
+        const segment = await this.segmentRepo.findById(validated.segment_id);
+        if (!segment) throw new NotFoundError('Segment', validated.segment_id);
+
+        if (
+            validated.schedule_at &&
+            new Date(validated.schedule_at) < new Date()
+        ) {
+            throw new ValidationError('schedule_at must be in the future');
+        }
+
+        // 3. Authorization check
+        await this.authz.assertCanCreateCampaign(
+            segment.tenant_id,
+            segment.user_count,
+        );
+
+        // 4. Persist
+        const campaign = await this.campaignRepo.insert({
+            ...validated,
+            status: validated.schedule_at ? 'scheduled' : 'draft',
+            tenant_id: segment.tenant_id,
+        });
+
+        // 5. Side effects
+        if (validated.schedule_at) {
+            await this.emailService.schedule(
+                campaign.id,
+                validated.schedule_at,
+            );
+        }
+
+        return campaign;
+    }
+}
+```
+
+**USE 4: WebMCP imperative tool** — same schema generates the JSON Schema for browser agents:
+
+```typescript
+// ui/webmcp.ts — browser-side agent tools
+import { zodToJsonSchema } from 'zod-to-json-schema';
+import { CreateCampaignInput } from '../schemas/campaign.js';
+
+if (navigator.modelContext) {
+    navigator.modelContext.registerTool({
+        name: 'create_campaign',
+        description: 'Create a marketing campaign...',
+        inputSchema: zodToJsonSchema(CreateCampaignInput), // Zod → JSON Schema
+        async execute(params) {
+            // Browser calls the same API endpoint
+            const res = await fetch('/api/campaigns', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(params),
+            });
+            return { result: await res.json() };
+        },
+    });
+}
+```
+
+#### Project Structure for Agent-Native SaaS
+
+```
+your-product/
+├── schemas/                    ← SHARED SCHEMAS (the glue)
+│   ├── campaign.ts             # CreateCampaignInput, Campaign, etc.
+│   ├── segment.ts              # CreateSegmentInput, Segment, etc.
+│   ├── event.ts                # IngestEventInput, Event, etc.
+│   └── index.ts                # re-exports all schemas
+│
+├── services/                   ← BUSINESS LOGIC (the brain)
+│   ├── campaign.service.ts     # create, send, getPerformance, suggestOptimization
+│   ├── segment.service.ts      # create, evaluate, list
+│   ├── event.service.ts        # ingest, query
+│   └── index.ts                # service factory with dependency injection
+│
+├── repos/                      ← DATA ACCESS (the memory)
+│   ├── campaign.repo.ts        # SQL queries, transactions
+│   ├── segment.repo.ts
+│   ├── event.repo.ts
+│   └── db.ts                   # connection pool, migrations
+│
+├── integrations/               ← EXTERNAL SERVICES (the arms)
+│   ├── email.ts                # SendGrid/Resend
+│   ├── push.ts                 # Firebase/OneSignal
+│   └── analytics.ts            # PostHog
+│
+├── adapters/                   ← THIN ADAPTERS (the mouths)
+│   ├── mcp/
+│   │   ├── server.ts           # MCP server — calls services
+│   │   └── index.ts            # entry point for stdio/SSE transport
+│   ├── api/
+│   │   ├── routes/
+│   │   │   ├── campaigns.ts    # REST routes — calls services
+│   │   │   ├── segments.ts
+│   │   │   └── events.ts
+│   │   └── server.ts           # Express/Hono app
+│   └── webmcp/
+│       └── tools.ts            # WebMCP registrations — calls API
+│
+├── auth/                       ← AUTHORIZATION
+│   ├── agent-auth.ts           # OAuth + scope validation for agents
+│   ├── session-auth.ts         # Session auth for human UI
+│   └── middleware.ts           # Shared auth middleware
+│
+└── tests/
+    ├── services/               # Test business logic directly
+    ├── adapters/               # Test MCP + API adapters
+    └── integration/            # End-to-end: agent → MCP → service → DB
+```
+
+#### Why This Structure Matters
+
+```
+THE ADAPTER PATTERN PAYOFF:
+
+  Adding a new interface = adding a new adapter, NOT rewriting logic.
+
+  Today:   MCP server + REST API
+  Month 2: + WebMCP tools (new adapter, same services)
+  Month 4: + Slack bot integration (new adapter, same services)
+  Month 6: + Zapier/Make integration (new adapter, same services)
+
+  Every adapter is ~50 lines of glue code.
+  Business logic changes ONCE in the service layer.
+
+  If you put business logic in the MCP tool handler:
+  ├── You'll copy-paste it to the API route handler
+  ├── Then to the WebMCP handler
+  ├── Then to the Slack bot handler
+  ├── They'll drift apart within weeks
+  └── Bugs get fixed in one place but not the others
+```
+
+#### Dependency Injection for Testability
+
+```typescript
+// services/index.ts — wire everything together
+import { CampaignService } from './campaign.service.js';
+import { SegmentService } from './segment.service.js';
+import { CampaignRepo } from '../repos/campaign.repo.js';
+import { SegmentRepo } from '../repos/segment.repo.js';
+import { EmailIntegration } from '../integrations/email.js';
+import { createPool } from '../repos/db.js';
+
+export function createServices(config: AppConfig) {
+    const pool = createPool(config.databaseUrl);
+
+    // Repos
+    const campaignRepo = new CampaignRepo(pool);
+    const segmentRepo = new SegmentRepo(pool);
+
+    // Integrations
+    const emailService = new EmailIntegration(config.sendgridApiKey);
+
+    // Auth
+    const authz = new AuthorizationService(config);
+
+    // Services (business logic)
+    const campaignService = new CampaignService(
+        campaignRepo,
+        segmentRepo,
+        emailService,
+        authz,
+    );
+    const segmentService = new SegmentService(segmentRepo);
+
+    return { campaignService, segmentService };
+}
+
+// MCP adapter uses it:
+const { campaignService, segmentService } = createServices(config);
+
+// API adapter uses the SAME instances:
+const app = createApiServer({ campaignService, segmentService });
+
+// Tests inject mocks:
+const campaignService = new CampaignService(
+    mockCampaignRepo, // in-memory
+    mockSegmentRepo, // in-memory
+    mockEmailService, // no-op
+    mockAuthz, // always allows
+);
+```
 
 ### Layer 2: Data Layer (Your Moat)
 
