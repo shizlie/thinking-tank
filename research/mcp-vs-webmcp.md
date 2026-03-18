@@ -841,6 +841,420 @@ When Sarah's agent acts on her behalf, what prevents it from going rogue?
 
 ---
 
+## How to Test WebMCP Right Now (March 2026)
+
+### Step 1: Enable WebMCP in Chrome Canary
+
+```
+1. Download Chrome Canary (or Chrome Beta 146+)
+   https://www.google.com/chrome/canary/
+
+2. Navigate to:   chrome://flags/#enable-webmcp-testing
+
+3. Set "WebMCP Testing" to "Enabled"
+
+4. Click "Relaunch"
+
+5. Verify it works:
+   → Open any HTTPS site
+   → Open DevTools (F12) → Console
+   → Type: "modelContext" in navigator
+   → Should return: true
+```
+
+### Step 2: Test With a Simple HTML Page
+
+Create a local test page to verify WebMCP tools work:
+
+```html
+<!-- test-webmcp.html — serve over HTTPS (required) -->
+<!DOCTYPE html>
+<html>
+<head><title>WebMCP Test</title></head>
+<body>
+  <h1>WebMCP Test Page</h1>
+
+  <!-- DECLARATIVE: form-based tool -->
+  <form toolname="greet_user"
+        tooldescription="Greet a user by name. Returns a personalized greeting."
+        toolautosubmit="true"
+        action="/api/greet" method="POST">
+    <input name="user_name" type="text" placeholder="Enter name" required>
+    <button type="submit">Greet</button>
+  </form>
+
+  <!-- IMPERATIVE: JS-based tool -->
+  <script>
+    if ("modelContext" in navigator) {
+      navigator.modelContext.registerTool({
+        name: "calculate_sum",
+        description: "Add two numbers together and return the result.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            a: { type: "number", description: "First number" },
+            b: { type: "number", description: "Second number" },
+          },
+          required: ["a", "b"],
+        },
+        async execute({ a, b }) {
+          return { result: a + b };
+        },
+      });
+
+      console.log("WebMCP tools registered successfully!");
+    } else {
+      console.warn("WebMCP not available — enable the Chrome flag");
+    }
+  </script>
+</body>
+</html>
+```
+
+To serve locally over HTTPS (required by WebMCP):
+```bash
+# Option A: use a quick local HTTPS server
+npx serve --ssl       # serves current directory over HTTPS
+
+# Option B: use Vite (if you have a project)
+npm create vite@latest webmcp-test && cd webmcp-test
+# copy the HTML above into index.html
+npm run dev -- --https
+```
+
+### Step 3: Inspect Registered Tools
+
+Install the **Model Context Tool Inspector Extension**:
+- Available on Chrome Web Store
+- Shows all WebMCP tools registered on the current page
+- Lets you execute tools manually with custom parameters
+- Supports testing with Gemini API
+
+Or use DevTools Console directly:
+```javascript
+// List all registered tools on the current page
+const tools = await navigator.modelContext.getTools();
+console.log(tools);
+
+// Manually call a tool
+const result = await navigator.modelContext.callTool("calculate_sum", { a: 5, b: 3 });
+console.log(result); // { result: 8 }
+```
+
+### The Tampermonkey Approach: Inject WebMCP Into ANY Website
+
+**Yes, this works.** You can use Tampermonkey to inject `navigator.modelContext.registerTool()` calls into websites you don't control. This lets you make ANY website agent-ready without modifying its source code.
+
+```
+HOW IT WORKS:
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    CHROME BROWSER                            │
+  │                                                              │
+  │  ┌──────────────┐                                           │
+  │  │ Tampermonkey  │ ──→ Injects userscript into page         │
+  │  │ Extension     │     BEFORE or AFTER page loads            │
+  │  └──────────────┘                                           │
+  │          │                                                   │
+  │          ▼                                                   │
+  │  ┌─────────────────────────────────────────────────────┐    │
+  │  │         YOUR EXISTING WEBSITE (any site)             │    │
+  │  │                                                      │    │
+  │  │  Page loads normally (site owner's code runs)        │    │
+  │  │          +                                           │    │
+  │  │  Tampermonkey script runs:                           │    │
+  │  │    navigator.modelContext.registerTool({              │    │
+  │  │      name: "search_products",                        │    │
+  │  │      execute: async (params) => {                    │    │
+  │  │        // interact with the page's DOM / JS          │    │
+  │  │        // call the site's own API endpoints          │    │
+  │  │        // return structured data                     │    │
+  │  │      }                                               │    │
+  │  │    })                                                │    │
+  │  │                                                      │    │
+  │  │  Now Chrome's agent can call "search_products"!      │    │
+  │  └─────────────────────────────────────────────────────┘    │
+  │                                                              │
+  │  ┌──────────────┐                                           │
+  │  │ Chrome Agent  │ ──→ Discovers injected tools              │
+  │  │ or WebClaw    │     and can call them                     │
+  │  └──────────────┘                                           │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+#### Tampermonkey Userscript Example
+
+```javascript
+// ==UserScript==
+// @name         WebMCP Tools for ExampleApp
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Inject WebMCP tools into an existing web app
+// @match        https://app.example.com/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    "use strict";
+
+    // Wait for WebMCP API to be available
+    if (!("modelContext" in navigator)) {
+        console.warn("[WebMCP Inject] WebMCP not available — enable Chrome flag");
+        return;
+    }
+
+    // TOOL 1: Search the site's product catalog
+    navigator.modelContext.registerTool({
+        name: "search_products",
+        description:
+            "Search the product catalog on this site. " +
+            "Returns matching products with names, prices, and IDs.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                query: {
+                    type: "string",
+                    description: "Search term for products",
+                },
+                category: {
+                    type: "string",
+                    description: "Optional category filter",
+                },
+            },
+            required: ["query"],
+        },
+        async execute({ query, category }) {
+            // Call the SITE'S OWN API (using the user's logged-in session)
+            const url = new URL("/api/products/search", window.location.origin);
+            url.searchParams.set("q", query);
+            if (category) url.searchParams.set("category", category);
+
+            const res = await fetch(url);
+            const data = await res.json();
+            return { result: data };
+        },
+    });
+
+    // TOOL 2: Add item to cart (interact with existing page JS)
+    navigator.modelContext.registerTool({
+        name: "add_to_cart",
+        description:
+            "Add a product to the shopping cart. " +
+            "Requires a product_id from search_products results.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                product_id: { type: "string", description: "Product ID to add" },
+                quantity: {
+                    type: "number",
+                    description: "Quantity (default 1)",
+                    default: 1,
+                },
+            },
+            required: ["product_id"],
+        },
+        async execute({ product_id, quantity = 1 }) {
+            // Call the site's cart API (session cookie handles auth)
+            const res = await fetch("/api/cart/items", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ product_id, quantity }),
+            });
+            const data = await res.json();
+
+            // Optionally update the UI (cart badge, etc.)
+            const cartBadge = document.querySelector(".cart-count");
+            if (cartBadge) cartBadge.textContent = data.total_items;
+
+            return { result: data };
+        },
+    });
+
+    // TOOL 3: Read page data (scrape structured info from DOM)
+    navigator.modelContext.registerTool({
+        name: "get_current_page_info",
+        description:
+            "Get structured information about the current page — " +
+            "product details, prices, reviews, breadcrumbs.",
+        inputSchema: { type: "object", properties: {} },
+        async execute() {
+            // Extract data from the DOM
+            const title = document.querySelector("h1")?.textContent?.trim();
+            const price = document.querySelector(".price")?.textContent?.trim();
+            const reviews = document.querySelector(".review-count")?.textContent?.trim();
+            const breadcrumbs = [...document.querySelectorAll(".breadcrumb a")].map(
+                (a) => a.textContent.trim()
+            );
+
+            return {
+                result: {
+                    title,
+                    price,
+                    reviews,
+                    breadcrumbs,
+                    url: window.location.href,
+                },
+            };
+        },
+    });
+
+    console.log("[WebMCP Inject] 3 tools registered for", window.location.hostname);
+})();
+```
+
+#### Tampermonkey Key Settings
+
+```javascript
+// CRITICAL: Use @grant none to run in the page's context
+// This gives you access to:
+// - navigator.modelContext (WebMCP API)
+// - The page's own JavaScript (window.*, stores, etc.)
+// - The page's fetch() with session cookies
+// - The page's DOM
+
+// @grant        none       ← REQUIRED for WebMCP access
+// @run-at       document-idle  ← run after page fully loads
+// @match        https://app.example.com/*  ← which sites to inject into
+```
+
+### Can Claude in Chrome Use WebMCP Tools?
+
+**Not yet natively, but it's coming.** Here's the current state:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ AGENT                        │ WebMCP Support    │ Status            │
+├──────────────────────────────┼───────────────────┼───────────────────┤
+│ Chrome's built-in agent      │ YES (native)      │ Early preview     │
+│ (Gemini-powered)             │                   │ Chrome 146 Canary │
+├──────────────────────────────┼───────────────────┼───────────────────┤
+│ Claude in Chrome extension   │ NOT YET           │ Feature requested │
+│ (Anthropic)                  │ Uses computer_use │ github issue      │
+│                              │ (screenshots)     │ #30645            │
+├──────────────────────────────┼───────────────────┼───────────────────┤
+│ WebClaw extension            │ YES (bridge)      │ Available now     │
+│ (community)                  │ WebMCP → MCP      │ github.com/       │
+│                              │ bridge for Claude,│ kuroko1t/webclaw  │
+│                              │ Cursor, any MCP   │                   │
+│                              │ client            │                   │
+├──────────────────────────────┼───────────────────┼───────────────────┤
+│ Model Context Tool Inspector │ YES (testing)     │ Available now     │
+│ (Chrome extension)           │ Manual tool       │ Chrome Web Store  │
+│                              │ execution + Gemini│                   │
+├──────────────────────────────┼───────────────────┼───────────────────┤
+│ keak-ai/webmcp-core          │ YES (generator)   │ Available now     │
+│ (npm package)                │ Auto-generates    │ npm install       │
+│                              │ tool definitions  │                   │
+│                              │ for ANY website   │                   │
+└──────────────────────────────┴───────────────────┴───────────────────┘
+```
+
+### WebClaw: Bridge WebMCP to Claude/Cursor Right Now
+
+WebClaw is the current best path to make Claude interact with WebMCP tools:
+
+```
+HOW WEBCLAW BRIDGES WebMCP → MCP:
+
+  ┌─────────────────────────────────────────────────────────┐
+  │                    CHROME BROWSER                        │
+  │                                                          │
+  │  ┌──────────────┐        ┌──────────────────────────┐   │
+  │  │   WebClaw     │        │  Your Website            │   │
+  │  │   Extension   │◄──────►│  (with WebMCP tools      │   │
+  │  │              │  reads  │   registered via site JS  │   │
+  │  │  Exposes all  │  tools │   or Tampermonkey)        │   │
+  │  │  WebMCP tools │        │                          │   │
+  │  │  as MCP tools │        └──────────────────────────┘   │
+  │  └──────┬───────┘                                        │
+  │         │ WebSocket (localhost)                           │
+  └─────────┼────────────────────────────────────────────────┘
+            │
+            ▼
+  ┌─────────────────────┐
+  │  WebClaw MCP Server │  ← translates WebMCP → MCP protocol
+  │  (localhost:18080)   │
+  └─────────┬───────────┘
+            │ stdio / HTTP
+            ▼
+  ┌─────────────────────┐
+  │  Claude Desktop     │  ← or Cursor, VS Code, any MCP client
+  │  Claude Code        │
+  │  Any MCP host       │
+  └─────────────────────┘
+
+  RESULT: Claude can call WebMCP tools registered on any page,
+  including tools YOU injected via Tampermonkey!
+```
+
+### keak-ai/webmcp-core: Auto-Generate Tools for Any Site
+
+Instead of manually writing Tampermonkey scripts, you can auto-scan a website:
+
+```bash
+# Scan any website and generate WebMCP tool definitions
+npx @keak/webmcp-core generate https://app.example.com
+
+# What it does:
+# 1. Crawls the site
+# 2. Finds every form, API call, and interactive element
+# 3. Outputs structured tool definitions
+# 4. Supports both declarative (HTML attrs) and imperative (registerTool)
+```
+
+This generates tool definitions you can then inject via Tampermonkey or include in your website's source code.
+
+### Practical Testing Workflow for Solo Builders
+
+```
+YOUR TESTING WORKFLOW:
+
+  STEP 1: Enable WebMCP in Chrome Canary
+          chrome://flags/#enable-webmcp-testing → Enabled → Relaunch
+
+  STEP 2: Choose your approach:
+
+    ┌─ OPTION A: You OWN the website ─────────────────────────────┐
+    │                                                              │
+    │  Add registerTool() calls to your source code                │
+    │  → Deploy → Test in Chrome Canary                            │
+    │  → Use Model Context Tool Inspector to debug                │
+    │  → Use WebClaw to test with Claude Desktop                   │
+    │                                                              │
+    │  BEST FOR: building agent-native from scratch                │
+    └──────────────────────────────────────────────────────────────┘
+
+    ┌─ OPTION B: You DON'T own the website (or want to prototype) ┐
+    │                                                              │
+    │  Write Tampermonkey userscript with registerTool() calls     │
+    │  → Install in Chrome Canary                                  │
+    │  → Navigate to the target site                               │
+    │  → Tools appear in Model Context Tool Inspector              │
+    │  → Use WebClaw to test with Claude Desktop                   │
+    │                                                              │
+    │  BEST FOR: prototyping, testing on existing sites,           │
+    │  proving the concept before modifying source code            │
+    └──────────────────────────────────────────────────────────────┘
+
+    ┌─ OPTION C: Auto-generate tools for any site ─────────────────┐
+    │                                                              │
+    │  npx @keak/webmcp-core generate https://app.example.com     │
+    │  → Review generated tool definitions                         │
+    │  → Paste into Tampermonkey script or your source code        │
+    │  → Test as above                                             │
+    │                                                              │
+    │  BEST FOR: retrofitting large existing sites quickly          │
+    └──────────────────────────────────────────────────────────────┘
+
+  STEP 3: Test with real agents
+    → Model Context Tool Inspector (manual execution)
+    → WebClaw + Claude Desktop (full AI agent interaction)
+    → Chrome's built-in agent (if available in your Canary build)
+```
+
+---
+
 ## Key Technologies Summary
 
 ```
@@ -882,3 +1296,8 @@ WebMCP TECHNOLOGY STACK:
 - [Chrome WebMCP Complete 2026 Guide — DEV Community](https://dev.to/czmilo/chrome-webmcp-the-complete-2026-guide-to-ai-agent-protocol-1ae9)
 - [MCP Transport Protocols Comparison — MCPcat](https://mcpcat.io/guides/comparing-stdio-sse-streamablehttp/)
 - [Why MCP Deprecated SSE — fka.dev](https://blog.fka.dev/blog/2025-06-06-why-mcp-deprecated-sse-and-go-with-streamable-http/)
+- [Enable WebMCP in Chrome 146 — SalamExperts](https://www.salamexperts.com/blog/ai/enable-webmcp-chrome/)
+- [WebClaw — WebMCP-native browser agent for Claude/Cursor](https://github.com/kuroko1t/webclaw)
+- [keak-ai/webmcp-core — Auto-generate WebMCP tools](https://github.com/keak-ai/webmcp-core)
+- [Claude in Chrome WebMCP feature request — GitHub #30645](https://github.com/anthropics/claude-code/issues/30645)
+- [Chrome's WebMCP Early Preview — DEV Community](https://dev.to/axrisi/chromes-webmcp-early-preview-the-end-of-ai-agents-clicking-buttons-b6e)
