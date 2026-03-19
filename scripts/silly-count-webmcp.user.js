@@ -1,3 +1,4 @@
+// biome-ignore-all lint: this is tampermonkey script
 // ==UserScript==
 // @name         Silly Count — WebMCP Agent Tools
 // @namespace    https://silly-count.harrycorn.com
